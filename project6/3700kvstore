@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+
+import sys, socket, select, time, json, random
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+last = 0
+last_heartbeat = 0
+
+SELECT_WAIT_TIME = 0.01 # 10 milliseconds
+HEARTBEAT_INTERFAL = 0.1 # 100 milliseconds
+TERMINATOR = b'}\n'
+buffer = b''
+leader = 'FFFF'
+candidate = False
+term = 0
+votes_acquired = 0
+votes = {}
+
+log = [{'term': 0}]
+commit_index = 0
+last_applied = 0
+
+next_index = {}
+match_index = {}
+
+def set_timeout():
+	return random.randrange(150, 300) * 0.001
+
+timeout = set_timeout()
+
+
+store = {} # key-value storage
+
+msg_received = []
+msg_to_send = []
+
+start = time.time()
+
+def log_debug(msg):
+	print("[debug " + str(time.time() - start) + "] " + my_id + ": " + msg)
+	
+def format_msg(msg, dst, type):
+	msg['src'] = my_id
+	msg['dst'] = dst
+	msg['leader'] = leader
+	msg['type'] = type
+	return msg
+
+def handle_msgs():
+	global msg_received
+	for i in range(0, len(msg_received)):
+		msg = msg_received.pop(0)
+		handle_message(msg)
+
+def handle_message(msg):
+	global last, msg_received
+	if msg['src'] == leader:
+		last = time.time()
+
+	if msg['type'] in ['get', 'put'] and not leader == my_id:
+		if leader == 'FFFF':
+			msg_received.append(msg)
+		else:
+			redirect_msg(msg)
+	elif msg['type'] == 'get':
+		handle_get_msg(msg)
+	elif msg['type'] == 'put':
+		handle_put_msg(msg)
+	elif msg['type'] == 'request_vote':
+		vote_for(msg)
+	elif msg['type'] == 'vote':
+		receive_vote(msg)
+	elif msg['type'] == 'append':
+		handle_append_msg(msg)
+	elif msg['type'] == 'response':
+		handle_response_msg(msg)
+
+def handle_get_msg(msg):
+	global msg_to_send
+	if msg['key'] not in store:
+		reply = format_msg({'MID' : msg['MID']}, msg['src'], 'fail')
+	else:
+		value = store[msg['key']]
+		# log_debug("getting key: " + str(msg['key']) + " value: " + str(value))
+		reply = format_msg({'MID' : msg['MID'], 'value' : value}, msg['src'], 'ok')
+	msg_to_send.append(reply)
+
+def handle_put_msg(msg):
+	global last_heartbeat, msg_to_send
+	entry = {'term' : term, 'client' : msg['src'], 'MID' : msg['MID'], 'key' : msg['key'], 'value' : msg['value']}
+	log_debug("new log entry: key: " + str(msg['key']) + " value: " + str(msg['value']))
+	log.append(entry)
+	
+	for id in replica_ids:
+		msg = format_append_rpc(id)
+		msg_to_send.append(msg)
+	last_heartbeat = time.time()
+	
+def format_append_rpc(id):
+	msg = {'term' : term, 'prevLogIndex' : next_index[id] - 1, 'prevLogTerm' : log[next_index[id] - 1]['term'], 'leader_commit' : commit_index}
+	entries = []
+	if next_index[id] < len(log):
+		entries = log[next_index[id]:]
+	msg['entries'] = entries
+	msg = format_msg(msg, id, 'append')
+	return msg
+
+def redirect_msg(msg):
+	global msg_to_send
+	reply = format_msg({'MID' : msg['MID']}, msg['src'], 'redirect')
+	msg_to_send.append(reply)
+
+def start_election():
+	global leader, candidate, term, timeout, votes_acquired, votes, last, msg_to_send
+	if term + 1 in votes:
+		return
+	log_debug("starting election")
+	last = time.time()
+	timeout = set_timeout()
+	term += 1
+	candidate = True
+	leader = 'FFFF'
+
+	# vote for self
+	votes_acquired = 1
+	votes[term] = my_id
+
+	# request votes
+	for id in replica_ids:
+		msg = format_msg({'term' : term, 'lastLogIndex' : len(log) - 1, 'lastLogTerm' : log[-1]['term']}, id, 'request_vote')
+		msg_to_send.append(msg)
+
+def vote_for(msg):
+	global votes, term, last, leader, msg_to_send
+	if msg['term'] in votes or term > msg['term']:
+		return
+	if not log_updated(msg['lastLogIndex'], msg['lastLogTerm']):
+		return
+	last = time.time()
+	leader = 'FFFF'
+	# log_debug("voting for " + str(msg['src']) + " for term: " + str(msg['term']))
+	votes[msg['term']] = msg['src']
+	msg = format_msg({'term' : msg['term']}, msg['src'], 'vote')
+	msg_to_send.append(msg)
+
+def log_updated(last_log_index, last_log_term):
+	if last_log_term < log[-1]['term']:
+		return False
+	return last_log_index >= len(log) - 1
+
+def receive_vote(msg):
+	global votes_acquired, last
+	if not candidate or msg['term'] != term:
+		return
+	# log_debug("receiving vote for term " + str(msg['term']) + " from: " + str(msg['src']))
+	last = time.time()
+	votes_acquired += 1
+
+	if votes_acquired > (len(replica_ids) + 1) / 2.0:
+		become_leader()
+
+def become_leader():
+	global leader, candidate, votes_acquired, match_index, next_index
+	log_debug("becoming new leader under term: " + str(term))
+	leader = my_id
+	candidate = False
+	votes_acquired = 0
+	for id in replica_ids:
+		next_index[id] = len(log)
+		match_index[id] = 0
+	send_heartbeat()
+
+def send_heartbeat():
+	global last_heartbeat, msg_to_send
+	last_heartbeat = time.time()
+	for id in replica_ids:
+		msg = format_append_rpc(id)
+		msg_to_send.append(msg)
+	
+def handle_append_msg(msg):
+	global last, term, leader, log, commit_index, last_applied, store, msg_to_send
+	if leader == my_id:
+		if term < msg['term']:
+			become_follower(msg['term'], msg['leader'])
+			handle_append_msg(msg)
+		else:
+			response = format_msg({'term' : term, 'success' : False, 'next_index' : len(log)}, msg['src'], 'response')
+			msg_to_send.append(response)
+	elif candidate:
+		if term <= msg['term'] or msg['leader_commit'] > len(log):
+			become_follower(msg['term'], msg['leader'])
+			handle_append_msg(msg)	
+		else:
+			response = format_msg({'term' : term, 'success' : False, 'next_index' : len(log)}, msg['src'], 'response')
+			msg_to_send.append(response)
+	else:
+		if msg['leader_commit'] >= len(log):
+			become_follower(msg['term'], msg['leader'])
+		elif msg['term'] < term or msg['prevLogIndex'] >= len(log) or msg['prevLogTerm'] != log[msg['prevLogIndex']]['term']:
+			response = format_msg({'term' : term, 'success' : False, 'next_index' : commit_index}, msg['src'], 'response')
+			msg_to_send.append(response)
+		else:
+			term = msg['term']
+			leader = msg['leader']
+			if len(msg['entries']) > 0:
+				log = log[0:msg['prevLogIndex'] + 1]
+				for entry in msg['entries']:
+					log.append(entry)
+			if msg['leader_commit'] > commit_index:
+				new_commit_index = min(msg['leader_commit'], len(log) - 1)
+				if new_commit_index != commit_index:
+					log_debug("update follower commit index: " + str(new_commit_index))
+				commit_index = new_commit_index
+				while commit_index > last_applied:
+					last_applied += 1
+					key = log[last_applied]['key']
+					value = log[last_applied]['value']
+					store[key] = value
+			# does not reply to heartbeat
+			if len(msg['entries']) > 0:
+				response = format_msg({'term' : term, 'success' : True, 'next_index' : len(log)}, msg['src'], 'response')
+				msg_to_send.append(response)
+
+def handle_response_msg(msg):
+	global next_index, last_applied, store, msg_to_send, term, leader, match_index
+	if leader == my_id:
+		if term < msg['term']:
+			become_follower(msg['term'], msg['leader'])
+			handle_response_msg(msg)
+		elif not msg['success']:
+			next_index[msg['src']] = msg['next_index']
+			msg = format_append_rpc(msg['src'])
+			msg_to_send.append(msg)
+		else:
+			index = min(msg['next_index'], len(log))
+			next_index[msg['src']] = index
+			match_index[msg['src']] = index - 1
+		update_commit_index()
+		while commit_index > last_applied:
+			last_applied += 1
+			entry = log[last_applied]
+			log_debug("putting key: " + str(entry['key'] + " value: " + str(entry['value'])))
+			store[entry['key']] = entry['value']
+			response = format_msg({'MID' : entry['MID']}, entry['client'], 'ok')
+			msg_to_send.append(response)
+	else:
+		if term < msg['term']:
+			term = msg['term']
+			leader = msg['leader']
+
+def update_commit_index():
+	global commit_index, match_index
+	for n in range(commit_index + 1, len(log)):
+		matches = 1
+		for id in replica_ids:
+			if match_index[id] >= n:
+				matches += 1
+		if matches > (len(replica_ids) + 1) / 2.0:
+			log_debug("updating commit index to " + str(n))
+			commit_index = n
+		else:
+			break
+
+def become_follower(new_term, new_leader):
+	global leader, term, candidate, votes_acquired, last
+	# log_debug("recognizing leader: " + str(new_leader) + " for term " + str(new_term))
+	last = time.time()
+	term = new_term
+	leader = new_leader
+	candidate = False
+	votes_acquired = 0
+
+def send_msg(msg):
+	# log_debug("sending msg " + str(msg))
+	sock.send(json.dumps(msg).encode() + b'\n')
+
+def send_msgs():
+	global msg_to_send
+	for msg in msg_to_send:
+		send_msg(msg)
+	msg_to_send = []
+
+# Receive
+def recv_msgs(sock):
+	global buffer
+	fresh_buf = sock.recv(16384)
+	# is this sock shutting down?
+	if len(fresh_buf) == 0:
+			return None
+	buffer += fresh_buf
+	msgs = []
+	while TERMINATOR in buffer:
+		position = buffer.find(TERMINATOR) + len(TERMINATOR)
+		msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+		buffer = buffer[position:]
+	return msgs
+
+
+
+def read_msgs():
+	global msg_received
+	ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+	if sock in ready:
+		msgs = recv_msgs(sock)
+		for msg in msgs:
+			# log_debug("received msg: " + str(msg))
+			msg_received.append(msg)
+			# handle_message(msg)
+
+time.sleep(1)
+while True:
+	read_msgs()
+	handle_msgs()
+	send_msgs()
+	clock = time.time()
+	if leader != my_id and clock - last > timeout:
+		start_election()
+	if leader == my_id and clock - last_heartbeat > HEARTBEAT_INTERFAL:
+		send_heartbeat()

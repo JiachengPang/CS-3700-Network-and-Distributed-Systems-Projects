@@ -1,0 +1,12 @@
+# CS3700 Project4
+
+# High-level approach:
+
+We used selective acks for the transport protocol. The receiver acks any valid data packet even if out of order, and the sender keeps track of packets that are acked. The receiver has a buffer to store received messages and check if data is complete every time it receives a new data packet that has not been acked. The sender has buffers to stored acked packets, packets to send, and packets in flight. The sender implements flow control and congestion control. If RTO is reached on its socket, it sets cwind to 1, reduces the ssthresh, and resend any packet that reaches RTO. It also estimates RTT every time it receives an ack. 
+
+# Challanges:
+1. The biggest challenge is figure out what to do if packets are dropped. If data packets are dropped, the sender times each packet and if a packet reaches RTO, it insert it into the msg_buffer and tries to resend it. If acks are droped, the receiver resend all previous acks to back to the sender, because with selective acks, it is hard for the receiver to figure out which ack is dropped. The more difficult senario is if eof acks are dropped. Once the sender decides that all data packets are acked, it sends the eof packet. The receiver gets the eof packet, send an ack and terminates. Therefore the final ack might be dropped, and the sender tries to resend the eof packet several times, if it does not receive an ack, it assumes that the receiver has terminated. The sender then terminate as well.
+2. Ack every packet vs. selective ack. We started out trying to implement acking for every packet, and fast re-transmit like TCP Reno. It's performance was not great and tend to slow down significantly on packet drops. It also results in a lot of unnecessary packets. We switched to selective ack as it seems more gracefull than acking every packet. The performance increased a lot and we were able to pass all tests
+
+# Testing
+We tested our program mainly with the provided netsim and nettest commands. We tried testing in many different network conditions including friendly networks, high latency networks, and delay and drop networks. Our code performed well on all tested networks. The bottleneck was usually packet drops where the performance declined and if timeout on nettest was too small, it sometimes failed to terminate correctly, which is also expected. We also wrote the logs to files or to stdout so we can debug the code.

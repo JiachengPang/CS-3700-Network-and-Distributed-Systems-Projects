@@ -1,0 +1,297 @@
+#!/usr/bin/python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+#
+
+import datetime
+import json
+import sys
+import socket
+import time
+import copy
+
+from base64 import b64encode
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 30
+SEQUENCE = 0
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+
+time.sleep(.5)
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " 3700send: " + string + "\n")
+
+# sender that uses selective acks
+class Sender:
+  
+  # constructor
+  def __init__(self):
+    self.adv_window = 100
+    self.cwind = 1
+    self.ssthresh = 100
+    self.sequence = SEQUENCE
+    self.rtt = 1
+    self.in_flight = [] # packets in flight
+    self.msg_buffer = [] # packets to be sent
+    self.acked = [] # packets acked
+    self.msg_start_time = {} # seq # -> start time
+    self.eof_attempts = 5
+    self.eof_in_flight = False
+    self.eof_packet = ""
+
+    # Set up the socket 
+    self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+    self.sock.settimeout(TIMEOUT)
+
+  # start sending packets
+  def start(self):
+    log("[starting]")
+    
+    # initial RTO
+    self.sock.settimeout(2.0 * self.rtt)
+
+    # send first packet
+    self.load_packets()
+    self.send_packets()
+
+    # send more packets
+    self.listen_and_send()
+  
+  # update the rtt esitmate using a new sample
+  def update_rtt(self, old, new):
+    new_rtt = (0.875 * old) + (0.125 * new)
+    log("[update rtt] new rtt is {}".format(new_rtt))
+    return new_rtt
+
+  # send the first packet in the msg buffer, mark it as in flight
+  def send_packet(self):
+    msg = copy.deepcopy(self.msg_buffer[0])
+    seq = msg['sequence']
+    if 'data' in msg:
+      msg['data'] = b64encode(msg['data']).decode()
+    packet = json.dumps(msg)
+    self.msg_start_time[seq] = time.time()
+    self.in_flight.append(self.msg_buffer[0])
+    del self.msg_buffer[0]
+
+    if self.sock.sendto(packet.encode(), dest) < len(packet):
+      log("[error] unable to fully send packet")
+    else:
+      if 'data' in msg:
+        log("[send data] " + str(seq) + " (" + str(len(msg['data'])) + ")")
+      elif "eof" in msg:
+        log("[sent eof] seq #: " + str(seq))
+
+  # load packets to msg buffer, fill up the window
+  def load_packets(self):
+    num = self.num_to_load() + 1
+    loaded = 0
+    for i in range(num):
+      data = sys.stdin.buffer.read(DATA_SIZE)
+      # no more data, load eof if not already loaded
+      if len(data) == 0:
+        if (len(self.msg_buffer) > 0 and 'eof' in self.msg_buffer[-1]) or (len(self.in_flight) > 0 and 'eof' in self.in_flight[-1]):
+          break
+        log("[load eof] seq #: {}, length: {}".format(self.sequence, len(data)))
+        msg = {
+          "sequence" : self.sequence,
+          "eof" : True
+        }
+        self.eof_packet = msg
+        # self.msg_buffer.append(msg)
+        break
+      # more data, load data
+      else:
+        log("[load data] seq #: {}, length: {}".format(self.sequence, len(data)))
+        msg = {
+          "sequence" : self.sequence,
+          "data" : data
+        }
+        self.msg_buffer.append(msg)
+        self.sequence += len(data)
+        loaded += 1
+    log("[packets loaded] {} packets loaded".format(loaded))
+    return loaded
+
+  # send packets allowed by window size
+  def send_packets(self):
+    # number of packets to send is bounded by the window size
+    num_to_send = max(0, int(min(self.cwind, self.adv_window)) - len(self.in_flight))
+    num_to_send = min(num_to_send, len(self.msg_buffer))
+    for i in range(num_to_send):
+      self.send_packet()
+    log("[packets sent] sent {} packets".format(num_to_send))
+    return num_to_send
+
+  # receive reply and keep sending packets
+  def listen_and_send(self): 
+    # read in data, send packets
+    while True:
+      self.sock.settimeout(2 * self.rtt)
+      log("ABOUT TO SLEEP")
+
+      handle_eof = False
+      try:
+        result = self.sock.recvfrom(MSG_SIZE)
+        if result:
+          (data, addr) = result
+          if not self.handle_reply(data):
+            handle_eof = True
+          
+        # timeout, enter slow start
+      except socket.timeout:
+        self.rto_reached()
+      
+      if handle_eof:
+        break
+
+      self.load_packets()
+      self.send_packets()
+    
+    # all data are acked, send eof
+    self.msg_buffer = []
+    self.in_flight = []
+    self.msg_buffer.append(self.eof_packet)
+    self.send_packets()
+    
+    while True:
+      self.sock.settimeout(2 * self.rtt)
+      log("ABOUT TO SLEEP")
+
+      try:
+        result = self.sock.recvfrom(MSG_SIZE)
+        if result:
+          (data, addr) = result
+
+          decoded = json.loads(data.decode())
+          seq = decoded['ack']
+          if seq == self.eof_packet['sequence']:
+            log("[complete]")
+            sys.exit(0)
+      except socket.timeout:
+        self.rto_reached()
+      
+      self.send_packets()
+
+  # timeout, enter slow start
+  # if eof is in flight but not acked, attempt to send eof a number of times before
+  # assuming it is received and the ack is dropped
+  def rto_reached(self):
+    if len(self.msg_buffer) == 0 and len(self.in_flight) == 1 and 'eof' in self.in_flight[0]:
+      log("[eof in flight]")
+      self.eof_in_flight = True
+    if self.eof_in_flight:
+      if self.eof_attempts > 0:
+        self.eof_attempts -= 1
+      else:
+        log("[RTO reached] the only packet in flight is eof, assuming ack for eof is dropped")
+        log("[complete]")
+        sys.exit(0)
+    self.check_rtt()
+    log("[RTO reached] set cwind to 1, set ssthresh to {}".format(self.ssthresh))
+
+  # find msg with the sequence number in a buffer
+  def find_msg(self, seq, arr):
+    for msg in arr:
+      if msg['sequence'] == seq:
+        return msg
+    return None
+
+  # check rtt on every packet, if a packet reaches rtt, append it into the msg buffer and resend
+  def check_rtt(self):
+    t = time.time()
+    resend = []
+    for msg in self.in_flight:
+      seq = msg['sequence']
+      if t - self.msg_start_time[seq] > self.rtt * 2:
+        log("[packet RTO reached] seq #: {}".format(seq))
+        if msg not in self.msg_buffer:
+          self.msg_buffer.append(msg)
+        resend.append(msg)
+    if len(resend) > 0:
+        self.ssthresh = max(1, round(self.ssthresh - self.cwind))
+        self.cwind = 1
+    for msg in resend:
+      self.in_flight.remove(msg)
+
+  # check the reply message, handle acks, check rtt and decide if data is complete
+  def handle_reply(self, data):
+    try:
+      decoded = json.loads(data)
+      seq = decoded['ack']
+      log("[recv ack] {}".format(seq))
+      # find the msg
+      msg = self.find_msg(seq, self.in_flight)
+      if msg is not None:
+        self.in_flight.remove(msg)
+      else:
+        msg = self.find_msg(seq, self.msg_buffer)
+        if msg is not None:
+          self.msg_buffer.remove(msg)
+      
+      # if msg is acked, add it to acked buffer
+      if msg is not None:
+        self.acked.append(msg)
+        rtt_sample = time.time() - self.msg_start_time[seq]
+        self.rtt = self.update_rtt(self.rtt, rtt_sample)
+
+        # resend timed out packets
+        self.check_rtt()
+        
+        # slow start
+        if self.cwind < self.ssthresh:
+          self.cwind += 1
+          log("[slow start] increase cwind to {}".format(self.cwind))
+        # congestion avoidance
+        else:
+          self.cwind += 1 / self.cwind
+          log("[congestion avoidence] increase cind to {}".format(self.cwind))
+      # check if data is complete
+      return not self.check_acked()
+    except (ValueError, KeyError, TypeError):
+      log("[recv corrupt packet]")
+  
+  # check the acked buffer to see if all data are acked and if eof is loaded
+  def check_acked(self):
+    if self.eof_packet == "":
+      return False
+    self.sort_acked()
+    if len(self.acked) < 1:
+      return False
+    for i in range(len(self.acked) - 1):
+      if self.acked[i]['sequence'] + len(self.acked[i]['data']) != self.acked[i + 1]['sequence']:
+        return False
+    if self.acked[-1]['sequence'] + len(self.acked[-1]['data']) != self.eof_packet['sequence']:
+      return False
+    return True
+  
+  # sort the acked buffer by seq number
+  def sort_acked(self):
+    for step in range(1, len(self.acked)):
+      key = self.acked[step]
+      j = step - 1
+
+      while j >= 0 and key['sequence'] < self.acked[j]['sequence']:
+        self.acked[j + 1] = self.acked[j]
+        j -= 1
+      
+      self.acked[j + 1] = key
+  
+  # number of packets to load is available window - in flight - msg buffer length
+  def num_to_load(self):
+    window = min(int(self.cwind), self.adv_window)
+    window -= (len(self.in_flight) + len(self.msg_buffer))
+    return max(0, window)
+
+# main 
+if __name__ == "__main__":
+  sender = Sender()
+  sender.start()

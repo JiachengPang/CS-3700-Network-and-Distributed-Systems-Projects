@@ -1,0 +1,129 @@
+#!/usr/bin/python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+
+import datetime
+import json
+import sys
+import socket
+
+from base64 import b64decode, decode
+from time import time
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " 3700recv: " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 4
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+# this receiver uses selective acks. It acks any valid packet even if not in order
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+seq_buffer = [] # seq received
+data_buffer = [] # data received
+msg_buffer = [] # replies to sender
+
+# check if all data is received, i.e. buffers are in order and eof is received
+def check_buffer():
+  log("[checking buffer]")
+  log("[checking buffer] " + str(seq_buffer))
+  if len(seq_buffer) < 2:
+    return False
+  for i in range(len(seq_buffer) - 1):
+    data = data_buffer[i]['data']
+    data = b64decode(data.encode())
+    if seq_buffer[i] + len(data) != seq_buffer[i + 1]:
+      return False
+  if 'eof' not in data_buffer[-1]:
+    return False
+  return True
+
+# insert a received packet into buffers
+def insert_index(seq):
+  index = 0
+  for i in range(len(seq_buffer)):
+    if seq_buffer[i] < seq:
+      index += 1
+  return index
+
+# send a packet to addr
+def send_packet(msg, addr):
+  log("ABOUT TO SEND " + msg)
+  sent = sock.sendto(msg.encode(), addr)
+  log("[sent] " + str(sent))
+  if sent < len(msg):
+    log("[error] unable to fully send packet")
+
+# Now listen for packets
+while True:
+  try:
+    result = sock.recvfrom(MSG_SIZE)
+
+    # If nothing is ready, we hit the timeout
+    if result:
+      (data, addr) = result
+
+      try:
+        decoded = json.loads(data.decode())
+        seq = decoded['sequence']
+        msg = json.dumps({"ack" : seq})
+        
+        # record the reply
+        if msg not in msg_buffer:
+          msg_buffer.append(msg)
+        send_packet(msg, addr)
+
+        # If there is data
+        if 'data' in decoded:
+          data = b64decode(decoded['data'].encode())
+          log("[recv data packet] seq #: {}, size: {}".format(seq, len(data)))
+          
+        # eof check if data is complete
+        elif 'eof' in decoded:
+          log("[recv eof] seq #: {}, inserting at the end.".format(seq))
+        
+        # insert new packet into buffers and ignore duplicates
+        if seq not in seq_buffer:
+          # insert 
+          index = insert_index(seq)
+          seq_buffer.insert(index, seq)
+          data_buffer.insert(index, decoded)
+          log("[insert packet] seq #: {}, size: {}".format(seq, len(data)))
+
+          # check if data is complete
+          if check_buffer():
+            log("[complete] writing to stdout")
+            for i in range(len(data_buffer) - 1):
+              data = b64decode(data_buffer[i]['data'].encode())
+              sys.stdout.buffer.write(data)
+            sys.exit(0)
+            
+      except (ValueError, KeyError, TypeError) as e:
+        log("[recv corrupt packet]")
+        raise e
+
+    # timeout, resend all msgs
+    else:
+      log("[timeout] resend msg")
+      for msg in msg_buffer:
+        send_packet(msg, addr)
+  except socket.timeout:
+    
+    # timeout, resend all msgs
+    if len(msg_buffer) != 0:
+      log("[timeout] resend msg")
+      for msg in msg_buffer:
+        send_packet(msg, addr)
